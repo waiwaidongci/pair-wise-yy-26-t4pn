@@ -24,6 +24,11 @@ python -m unittest discover -s tests -v
 - `GET /api/duplicates?product_id=...&version=...`
 - `POST /api/members`、`POST /api/evidence`
 - `POST /api/fixes`、`POST /api/extensions`
+- `POST /api/extension-requests`（协调员发起延期会签）
+- `POST /api/extension-requests/{id}/vote`（报告人/维护者表决，含意见）
+- `POST /api/extension-requests/{id}/review`（另一名协调员复核）
+- `GET /api/extension-requests/{id}`（每人意见、当前卡在谁、新旧期限）
+- `POST /api/reports/{id}/details`（修改摘要/受影响版本）
 - `POST /api/reports/{id}/status`
 - `POST /api/advisories`、`GET /api/reports/{id}/advisory?user_id=...`
 - `POST /api/reports/{id}/publish`
@@ -31,3 +36,7 @@ python -m unittest discover -s tests -v
 - `GET /api/reports/{id}/notifications`
 
 状态流转限制为 `new -> triaged -> fixing -> resolved -> published`，拒绝或回到修复中也有显式规则。披露日期早于保密期限时请求会失败，不会只修改显示状态。
+
+## 延期会签
+
+协调员不再单方面延长保密期，而是发起会签申请（新期限 + 理由）：报告人和全部维护者分别表决同意或反对，任何人反对即关闭申请、原保密期照旧；全员同意后须由另一位协调员复核才生效，发起人复核自己的申请会被拒绝。会签进行期间（含已表决部分票）若报告摘要、受影响版本或修复计划被修改，或协调员直接调整了保密期，该会签立即失效，需重新发起。会签详情展示每人表决意见、当前等待谁（未表决成员或待复核协调员）以及新旧保密期限。

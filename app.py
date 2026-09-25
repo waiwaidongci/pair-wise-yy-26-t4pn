@@ -32,6 +32,8 @@ class Handler(BaseHTTPRequestHandler):
                 return self._json(200,{"notifications":self.db.notifications_for(int(parts[2]))})
             if len(parts)==4 and parts[:2]==["api","reports"] and parts[3]=="advisory":
                 uid=int(parse_qs(parsed.query).get("user_id",[0])[0]); return self._json(200,self.db.get_advisory(int(parts[2]),uid))
+            if len(parts)==3 and parts[:2]==["api","extension-requests"]:
+                return self._json(200,self.db.extension_request_detail(int(parts[2])))
             if parsed.path=="/api/duplicates":
                 q=parse_qs(parsed.query); return self._json(200,{"duplicates":self.db.find_duplicate_reports(int(q.get("product_id",[0])[0]),q.get("version",[""])[0])})
             self._json(404,{"ok":False,"error":"接口不存在"})
@@ -47,8 +49,12 @@ class Handler(BaseHTTPRequestHandler):
             if path=="/api/evidence": return self._json(201,{"ok":True,"id":self.db.add_evidence(int(b.get("report_id",0)),str(b.get("name","")),str(b.get("content","")),str(b.get("classification","private")),int(b.get("uploaded_by",0)))})
             if path=="/api/fixes": return self._json(201,{"ok":True,"id":self.db.set_fix_plan(int(b.get("report_id",0)),int(b.get("maintainer_id",0)),str(b.get("plan","")),b.get("target_date"))})
             if path=="/api/extensions": return self._json(201,{"ok":True,"id":self.db.extend_embargo(int(b.get("report_id",0)),str(b.get("new_deadline","")),str(b.get("reason","")),int(b.get("coordinator_id",0)))})
+            if path=="/api/extension-requests": return self._json(201,{"ok":True,"id":self.db.propose_extension(int(b.get("report_id",0)),str(b.get("new_deadline","")),str(b.get("reason","")),int(b.get("coordinator_id",0)))})
+            if len(parts)==4 and parts[:2]==["api","extension-requests"] and parts[3]=="vote": self.db.vote_extension(int(parts[2]),int(b.get("user_id",0)),bool(b.get("approve",False)),str(b.get("comment",""))); return self._json(200,{"ok":True})
+            if len(parts)==4 and parts[:2]==["api","extension-requests"] and parts[3]=="review": self.db.review_extension(int(parts[2]),int(b.get("coordinator_id",0)),bool(b.get("approve",True)),str(b.get("note",""))); return self._json(200,{"ok":True})
             if path=="/api/advisories": return self._json(201,{"ok":True,"id":self.db.create_advisory_draft(int(b.get("report_id",0)),str(b.get("content","")),int(b.get("user_id",0)))})
             if len(parts)==4 and parts[:2]==["api","reports"] and parts[3]=="status": self.db.set_status(int(parts[2]),str(b.get("status","")),int(b.get("user_id",0)),str(b.get("note",""))); return self._json(200,{"ok":True})
+            if len(parts)==4 and parts[:2]==["api","reports"] and parts[3]=="details": self.db.update_report_details(int(parts[2]),int(b.get("user_id",0)),b.get("summary"),b.get("versions"),str(b.get("version_details",""))); return self._json(200,{"ok":True})
             if len(parts)==4 and parts[:2]==["api","reports"] and parts[3]=="publish": self.db.publish_report(int(parts[2]),int(b.get("coordinator_id",0)),b.get("as_of")); return self._json(200,{"ok":True})
             self._json(404,{"ok":False,"error":"接口不存在"})
         except (DomainError,ValueError) as exc: self._json(400,{"ok":False,"error":str(exc)})

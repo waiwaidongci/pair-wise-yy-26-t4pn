@@ -124,6 +124,27 @@ class VulnerabilityDB:
               coordinator_id INTEGER NOT NULL REFERENCES users(id),
               created_at TEXT NOT NULL
             );
+            CREATE TABLE IF NOT EXISTS extension_requests (
+              id INTEGER PRIMARY KEY AUTOINCREMENT,
+              report_id INTEGER NOT NULL REFERENCES reports(id) ON DELETE CASCADE,
+              old_deadline TEXT NOT NULL,
+              new_deadline TEXT NOT NULL,
+              reason TEXT NOT NULL,
+              coordinator_id INTEGER NOT NULL REFERENCES users(id),
+              status TEXT NOT NULL DEFAULT 'voting'
+                CHECK(status IN ('voting','review','approved','rejected','invalidated')),
+              created_at TEXT NOT NULL,
+              resolved_at TEXT
+            );
+            CREATE TABLE IF NOT EXISTS extension_votes (
+              id INTEGER PRIMARY KEY AUTOINCREMENT,
+              request_id INTEGER NOT NULL REFERENCES extension_requests(id) ON DELETE CASCADE,
+              user_id INTEGER NOT NULL REFERENCES users(id),
+              approve INTEGER NOT NULL CHECK(approve IN (0,1)),
+              comment TEXT NOT NULL DEFAULT '',
+              created_at TEXT NOT NULL,
+              UNIQUE(request_id, user_id)
+            );
             CREATE TABLE IF NOT EXISTS notifications (
               id INTEGER PRIMARY KEY AUTOINCREMENT,
               report_id INTEGER NOT NULL REFERENCES reports(id) ON DELETE CASCADE,
@@ -305,6 +326,10 @@ class VulnerabilityDB:
         payload["fix_plan"] = dict(self.conn.execute("SELECT * FROM fix_plans WHERE report_id=?", (report_id,)).fetchone() or {})
         payload["history"] = [dict(r) for r in self.conn.execute("SELECT * FROM status_history WHERE report_id=? ORDER BY id", (report_id,))]
         payload["extensions"] = [dict(r) for r in self.conn.execute("SELECT * FROM extensions WHERE report_id=? ORDER BY id", (report_id,))]
+        payload["extension_requests"] = [
+            self.extension_request_detail(row["id"])
+            for row in self.conn.execute("SELECT id FROM extension_requests WHERE report_id=? ORDER BY id", (report_id,))
+        ]
         return payload
 
     def set_status(self, report_id: int, new_status: str, user_id: int, note: str = "") -> None:
@@ -355,6 +380,7 @@ class VulnerabilityDB:
                 plan_id = self.conn.execute("SELECT id FROM fix_plans WHERE report_id=?", (report_id,)).fetchone()["id"]
             else:
                 plan_id = int(cur.lastrowid)
+            self._invalidate_extension_requests(report_id, "修复计划被修改")
         return int(plan_id)
 
     def extend_embargo(self, report_id: int, new_deadline: str, reason: str, coordinator_id: int) -> int:
@@ -374,6 +400,7 @@ class VulnerabilityDB:
         if report["status"] == "published":
             raise DomainError("已披露报告不能延期")
         with self.transaction():
+            self._invalidate_extension_requests(report_id, "保密期被协调员直接调整")
             cur = self.conn.execute(
                 "INSERT INTO extensions(report_id,old_deadline,new_deadline,reason,coordinator_id,created_at) VALUES(?,?,?,?,?,?)",
                 (report_id, report["confidential_until"], new_deadline, reason.strip(), coordinator_id, datetime.now().isoformat()),
@@ -382,6 +409,191 @@ class VulnerabilityDB:
             for member in self.conn.execute("SELECT user_id FROM report_members WHERE report_id=?", (report_id,)).fetchall():
                 self._notify(report_id, member["user_id"], "extension", f"保密期延长至 {new_deadline}: {reason.strip()}")
         return int(cur.lastrowid)
+
+    def update_report_details(self, report_id: int, user_id: int, summary: str | None = None,
+                              versions: list[str] | None = None, version_details: str = "") -> None:
+        report = self.conn.execute("SELECT * FROM reports WHERE id=?", (report_id,)).fetchone()
+        if not report:
+            raise DomainError("报告不存在")
+        user = self._user(user_id)
+        if user["role"] != "coordinator" and report["reporter_id"] != user_id:
+            raise DomainError("只有报告人或协调员可以修改报告内容")
+        if report["status"] == "published":
+            raise DomainError("已披露报告不能修改")
+        if summary is None and versions is None:
+            raise DomainError("未提供要修改的内容")
+        new_summary = report["summary"] if summary is None else summary.strip()
+        if not new_summary:
+            raise DomainError("摘要不能为空")
+        new_versions = None
+        if versions is not None:
+            new_versions = []
+            for version in versions:
+                key = str(version).strip()
+                if not key:
+                    raise DomainError("版本号不能为空")
+                if key not in new_versions:
+                    new_versions.append(key)
+            if not new_versions:
+                raise DomainError("受影响版本不能为空")
+        current_versions = [row["version_key"] for row in self.conn.execute(
+            "SELECT version_key FROM affected_versions WHERE report_id=? ORDER BY id", (report_id,))]
+        if new_summary == report["summary"] and (new_versions is None or new_versions == current_versions):
+            return
+        now = datetime.now().isoformat()
+        with self.transaction():
+            self.conn.execute("UPDATE reports SET summary=?,updated_at=? WHERE id=?", (new_summary, now, report_id))
+            if new_versions is not None:
+                self.conn.execute("DELETE FROM affected_versions WHERE report_id=?", (report_id,))
+                for key in new_versions:
+                    self.conn.execute(
+                        "INSERT INTO affected_versions(report_id,version_key,details) VALUES(?,?,?)",
+                        (report_id, key, version_details.strip()),
+                    )
+            self._invalidate_extension_requests(report_id, "报告摘要或受影响版本被修改")
+            for member in self.conn.execute("SELECT user_id FROM report_members WHERE report_id=?", (report_id,)).fetchall():
+                self._notify(report_id, member["user_id"], "report_edit", "报告摘要或受影响版本被修改")
+
+    def _required_voters(self, report_id: int) -> list[int]:
+        report = self.conn.execute("SELECT reporter_id FROM reports WHERE id=?", (report_id,)).fetchone()
+        if not report:
+            raise DomainError("报告不存在")
+        voters = [report["reporter_id"]]
+        voters.extend(row["user_id"] for row in self.conn.execute(
+            "SELECT user_id FROM report_members WHERE report_id=? AND member_role='maintainer' ORDER BY user_id", (report_id,)))
+        return voters
+
+    def _extension_request(self, request_id: int) -> sqlite3.Row:
+        req = self.conn.execute("SELECT * FROM extension_requests WHERE id=?", (request_id,)).fetchone()
+        if not req:
+            raise DomainError("延期会签不存在")
+        return req
+
+    def _notify_request_participants(self, req: sqlite3.Row, kind: str, message: str) -> None:
+        user_ids = set(self._required_voters(req["report_id"]))
+        user_ids.add(req["coordinator_id"])
+        user_ids.update(row["user_id"] for row in self.conn.execute(
+            "SELECT user_id FROM report_members WHERE report_id=?", (req["report_id"],)))
+        for uid in user_ids:
+            self._notify(req["report_id"], uid, kind, message)
+
+    def _invalidate_extension_requests(self, report_id: int, cause: str) -> None:
+        rows = self.conn.execute(
+            "SELECT * FROM extension_requests WHERE report_id=? AND status IN ('voting','review')", (report_id,)).fetchall()
+        now = datetime.now().isoformat()
+        for req in rows:
+            self.conn.execute("UPDATE extension_requests SET status='invalidated',resolved_at=? WHERE id=?", (now, req["id"]))
+            self._notify_request_participants(req, "extension_invalidated", f"延期会签 #{req['id']} 已失效: {cause}")
+
+    def propose_extension(self, report_id: int, new_deadline: str, reason: str, coordinator_id: int) -> int:
+        actor = self._user(coordinator_id)
+        report = self.conn.execute("SELECT * FROM reports WHERE id=?", (report_id,)).fetchone()
+        if not report or actor["role"] != "coordinator":
+            raise DomainError("只有协调员可以发起延期会签")
+        if report["status"] == "published":
+            raise DomainError("已披露报告不能延期")
+        try:
+            new_date = datetime.strptime(new_deadline, "%Y-%m-%d").date()
+            old_date = datetime.strptime(report["confidential_until"], "%Y-%m-%d").date()
+        except ValueError as exc:
+            raise DomainError("日期必须使用 YYYY-MM-DD") from exc
+        if new_date <= old_date:
+            raise DomainError("新截止日期必须晚于当前日期")
+        if len(reason.strip()) < 5:
+            raise DomainError("延期理由至少5个字符")
+        now = datetime.now().isoformat()
+        with self.transaction():
+            self._invalidate_extension_requests(report_id, "协调员发起了新的延期会签")
+            cur = self.conn.execute(
+                "INSERT INTO extension_requests(report_id,old_deadline,new_deadline,reason,coordinator_id,created_at) VALUES(?,?,?,?,?,?)",
+                (report_id, report["confidential_until"], new_deadline, reason.strip(), coordinator_id, now))
+            request_id = int(cur.lastrowid)
+            req = self._extension_request(request_id)
+            self._notify_request_participants(req, "extension_request", f"延期会签 #{request_id}: 申请将保密期延长至 {new_deadline}，请报告人和维护者表决")
+        return request_id
+
+    def vote_extension(self, request_id: int, user_id: int, approve: bool, comment: str = "") -> None:
+        req = self._extension_request(request_id)
+        self._user(user_id)
+        if req["status"] != "voting":
+            raise DomainError("该会签不在表决阶段")
+        voters = self._required_voters(req["report_id"])
+        if user_id not in voters:
+            raise DomainError("只有报告人和维护者可以表决")
+        now = datetime.now().isoformat()
+        with self.transaction():
+            try:
+                self.conn.execute(
+                    "INSERT INTO extension_votes(request_id,user_id,approve,comment,created_at) VALUES(?,?,?,?,?)",
+                    (request_id, user_id, 1 if approve else 0, comment.strip(), now))
+            except sqlite3.IntegrityError as exc:
+                raise DomainError("该成员已表决") from exc
+            if not approve:
+                self.conn.execute("UPDATE extension_requests SET status='rejected',resolved_at=? WHERE id=?", (now, request_id))
+                self._notify_request_participants(req, "extension_rejected", f"延期会签 #{request_id} 被反对，保密期维持 {req['old_deadline']}")
+                return
+            approved = {row["user_id"] for row in self.conn.execute(
+                "SELECT user_id FROM extension_votes WHERE request_id=? AND approve=1", (request_id,))}
+            if all(uid in approved for uid in voters):
+                self.conn.execute("UPDATE extension_requests SET status='review' WHERE id=?", (request_id,))
+                self._notify_request_participants(req, "extension_review", f"延期会签 #{request_id} 已全员同意，待另一位协调员复核")
+
+    def review_extension(self, request_id: int, coordinator_id: int, approve: bool = True, note: str = "") -> None:
+        actor = self._user(coordinator_id)
+        req = self._extension_request(request_id)
+        if actor["role"] != "coordinator":
+            raise DomainError("只有协调员可以复核延期会签")
+        if req["status"] != "review":
+            raise DomainError("该会签不在复核阶段")
+        if coordinator_id == req["coordinator_id"]:
+            raise DomainError("发起人不能复核自己的延期申请")
+        report = self.conn.execute("SELECT * FROM reports WHERE id=?", (req["report_id"],)).fetchone()
+        now = datetime.now().isoformat()
+        with self.transaction():
+            if not approve:
+                self.conn.execute("UPDATE extension_requests SET status='rejected',resolved_at=? WHERE id=?", (now, request_id))
+                self._notify_request_participants(req, "extension_rejected", f"延期会签 #{request_id} 复核未通过，保密期维持 {req['old_deadline']}")
+                return
+            if report["status"] == "published":
+                raise DomainError("已披露报告不能延期")
+            current = datetime.strptime(report["confidential_until"], "%Y-%m-%d").date()
+            new_date = datetime.strptime(req["new_deadline"], "%Y-%m-%d").date()
+            if new_date <= current:
+                raise DomainError("新截止日期必须晚于当前日期")
+            self.conn.execute("UPDATE extension_requests SET status='approved',resolved_at=? WHERE id=?", (now, request_id))
+            self.conn.execute(
+                "INSERT INTO extensions(report_id,old_deadline,new_deadline,reason,coordinator_id,created_at) VALUES(?,?,?,?,?,?)",
+                (req["report_id"], report["confidential_until"], req["new_deadline"], req["reason"], req["coordinator_id"], now))
+            self.conn.execute("UPDATE reports SET confidential_until=?,updated_at=? WHERE id=?", (req["new_deadline"], now, req["report_id"]))
+            self._notify_request_participants(req, "extension", f"延期会签 #{request_id} 复核通过，保密期延长至 {req['new_deadline']}")
+
+    def extension_request_detail(self, request_id: int) -> dict:
+        req = self._extension_request(request_id)
+        report = self.conn.execute("SELECT * FROM reports WHERE id=?", (req["report_id"],)).fetchone()
+        payload = dict(req)
+        payload["coordinator_name"] = self._user(req["coordinator_id"])["name"]
+        payload["current_deadline"] = report["confidential_until"]
+        votes = [dict(row) for row in self.conn.execute(
+            "SELECT v.*,u.name AS user_name,u.role AS user_role FROM extension_votes v JOIN users u ON u.id=v.user_id "
+            "WHERE v.request_id=? ORDER BY v.id", (request_id,))]
+        payload["votes"] = votes
+        voted = {vote["user_id"] for vote in votes}
+        required = []
+        for uid in self._required_voters(req["report_id"]):
+            user = self._user(uid)
+            required.append({"user_id": uid, "name": user["name"], "role": user["role"], "voted": uid in voted})
+        payload["required_voters"] = required
+        payload["pending_voters"] = [v for v in required if not v["voted"]]
+        if req["status"] == "voting":
+            names = "、".join(v["name"] for v in payload["pending_voters"])
+            payload["pending_on"] = f"等待表决: {names}" if names else ""
+        elif req["status"] == "review":
+            reviewers = [row["name"] for row in self.conn.execute(
+                "SELECT name FROM users WHERE role='coordinator' AND id<>? ORDER BY id", (req["coordinator_id"],))]
+            payload["pending_on"] = "等待协调员复核: " + "、".join(reviewers)
+        else:
+            payload["pending_on"] = ""
+        return payload
 
     def create_advisory_draft(self, report_id: int, content: str, user_id: int) -> int:
         if not self.can_view(report_id, user_id):
